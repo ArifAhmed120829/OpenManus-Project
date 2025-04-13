@@ -1,71 +1,107 @@
-from typing import Optional
+from openai import AsyncOpenAI
+import logging
+import httpx
+from bs4 import BeautifulSoup
 
-from pydantic import Field, model_validator
+logger = logging.getLogger(__name__)
 
-from app.agent.browser import BrowserContextHelper
-from app.agent.toolcall import ToolCallAgent
-from app.config import config
-from app.prompt.manus import NEXT_STEP_PROMPT, SYSTEM_PROMPT
-from app.tool import Terminate, ToolCollection
-from app.tool.browser_use_tool import BrowserUseTool
-from app.tool.python_execute import PythonExecute
-from app.tool.str_replace_editor import StrReplaceEditor
-
-
-class Manus(ToolCallAgent):
-    """A versatile general-purpose agent."""
-
-    name: str = "Manus"
-    description: str = (
-        "A versatile agent that can solve various tasks using multiple tools"
-    )
-
-    system_prompt: str = SYSTEM_PROMPT.format(directory=config.workspace_root)
-    next_step_prompt: str = NEXT_STEP_PROMPT
-
-    max_observe: int = 10000
-    max_steps: int = 20
-
-    # Add general-purpose tools to the tool collection
-    available_tools: ToolCollection = Field(
-        default_factory=lambda: ToolCollection(
-            PythonExecute(), BrowserUseTool(), StrReplaceEditor(), Terminate()
-        )
-    )
-
-    special_tool_names: list[str] = Field(default_factory=lambda: [Terminate().name])
-
-    browser_context_helper: Optional[BrowserContextHelper] = None
-
-    @model_validator(mode="after")
-    def initialize_helper(self) -> "Manus":
-        self.browser_context_helper = BrowserContextHelper(self)
-        return self
-
-    async def think(self) -> bool:
-        """Process current state and decide next actions with appropriate context."""
-        original_prompt = self.next_step_prompt
-        recent_messages = self.memory.messages[-3:] if self.memory.messages else []
-        browser_in_use = any(
-            tc.function.name == BrowserUseTool().name
-            for msg in recent_messages
-            if msg.tool_calls
-            for tc in msg.tool_calls
+class Manus:
+    def __init__(self, llm_config=None):
+        default_config = {
+            "base_url": "http://localhost:11434/v1",
+            "api_key": "ollama",
+            "model": "tinyllama",
+            "temperature": 0.3,
+            "max_tokens": 4096
+        }
+        self.config = {**default_config, **(llm_config or {})}
+        self.client = AsyncOpenAI(
+            base_url=self.config["base_url"],
+            api_key=self.config["api_key"]
         )
 
-        if browser_in_use:
-            self.next_step_prompt = (
-                await self.browser_context_helper.format_next_step_prompt()
-            )
+    async def fetch_url_content(self, url):
+        """Fetch HTML content of a URL"""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url)
+                return response.text
+        except Exception as e:
+            logger.error(f"Error fetching URL: {e}")
+            return None
 
-        result = await super().think()
+    async def analyze_seo(self, html_content):
+        """Analyze HTML content for SEO factors"""
+        soup = BeautifulSoup(html_content, 'html.parser')
 
-        # Restore original prompt
-        self.next_step_prompt = original_prompt
+        # Basic SEO checks
+        title = soup.find('title').text if soup.find('title') else "Missing"
+        meta_desc = soup.find('meta', attrs={'name': 'description'})
+        h1_tags = [h1.text for h1 in soup.find_all('h1')]
+        images_without_alt = [img['src'] for img in soup.find_all('img') if not img.get('alt')]
 
-        return result
+        return {
+            'title': title,
+            'meta_description': meta_desc.get('content') if meta_desc else "Missing",
+            'h1_count': len(h1_tags),
+            'images_missing_alt': len(images_without_alt),
+            'basic_issues': {
+                'missing_title': title == "Missing",
+                'missing_meta_description': meta_desc is None,
+                'multiple_h1': len(h1_tags) > 1,
+                'images_without_alt': images_without_alt
+            }
+        }
+
+    async def generate_report(self, url, analysis):
+        """Generate markdown report using LLM"""
+        prompt = f"""
+        Generate a professional SEO audit report for {url} in markdown format.
+        Include the following sections:
+        1. Basic Information
+        2. On-Page SEO Analysis
+        3. Technical SEO Issues
+        4. Recommendations
+
+        Here's the analysis data:
+        {analysis}
+        """
+
+        response = await self.client.chat.completions.create(
+            model=self.config["model"],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=self.config["temperature"],
+            max_tokens=self.config["max_tokens"]
+        )
+
+        return response.choices[0].message.content
+
+    async def run(self, prompt):
+        try:
+            # Extract URL from prompt
+            if 'url:' in prompt.lower():
+                url = prompt.split('url:')[1].split('"')[1]
+            else:
+                url = prompt.split()[-1].strip('"')
+
+            # Fetch and analyze content
+            html = await self.fetch_url_content(url)
+            if not html:
+                raise ValueError("Failed to fetch URL content")
+
+            analysis = await self.analyze_seo(html)
+            report = await self.generate_report(url, analysis)
+
+            # Save report
+            with open('report.md', 'w') as f:
+                f.write(report)
+
+            print(f"SEO audit report generated and saved to report.md")
+
+        except Exception as e:
+            logger.error(f"Error during SEO audit: {e}")
+            raise
 
     async def cleanup(self):
-        """Clean up Manus agent resources."""
-        if self.browser_context_helper:
-            await self.browser_context_helper.cleanup_browser()
+        await self.client.close()
+        logger.info("Client connection closed")
